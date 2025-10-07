@@ -1,20 +1,141 @@
 import argparse
+import json
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional, List
+from typing import Any, AsyncIterator, List, Optional
+
+import httpx
 from dotenv import load_dotenv
-import json
-from fastmcp import FastMCP, Context
+from fastmcp import Context, FastMCP
 from pymilvus import (
-    MilvusClient,
-    DataType,
     AnnSearchRequest,
+    DataType,
+    MilvusClient,
     RRFRanker,
 )
 
 
+class EmbeddingService:
+    """Service for generating embeddings from text using an external API."""
+
+    def __init__(
+        self,
+        api_url: Optional[str] = None,
+        model: str = "text-embedding-ada-002",
+        api_key: Optional[str] = None,
+    ):
+        """
+        Initialize the embedding service.
+
+        Args:
+            api_url: URL of the embedding API endpoint
+            model: Name of the embedding model to use
+            api_key: Optional API key for authentication
+        """
+        self.api_url = api_url
+        self.model = model
+        self.api_key = api_key
+        self.enabled = api_url is not None
+
+    async def embed_text(self, text: str) -> List[float]:
+        """
+        Generate embedding vector from text.
+
+        Args:
+            text: Input text to embed
+
+        Returns:
+            List of floats representing the embedding vector
+
+        Raises:
+            ValueError: If embedding service is not configured or API call fails
+        """
+        if not self.enabled:
+            raise ValueError(
+                "Embedding service not configured. Set EMBEDDING_API_URL environment variable."
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+
+                payload = {"model": self.model, "input": text}
+
+                response = await client.post(
+                    self.api_url, json=payload, headers=headers
+                )
+                response.raise_for_status()
+
+                data = response.json()
+
+                # Handle OpenAI-compatible response format
+                if "data" in data and len(data["data"]) > 0:
+                    return data["data"][0]["embedding"]
+                # Handle direct embedding array response
+                elif "embedding" in data:
+                    return data["embedding"]
+                else:
+                    raise ValueError(f"Unexpected API response format: {data}")
+
+        except httpx.HTTPError as e:
+            raise ValueError(f"Embedding API request failed: {str(e)}")
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            raise ValueError(f"Failed to parse embedding API response: {str(e)}")
+
+    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embedding vectors for multiple texts.
+
+        Args:
+            texts: List of input texts to embed
+
+        Returns:
+            List of embedding vectors
+
+        Raises:
+            ValueError: If embedding service is not configured or API call fails
+        """
+        if not self.enabled:
+            raise ValueError(
+                "Embedding service not configured. Set EMBEDDING_API_URL environment variable."
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+
+                payload = {"model": self.model, "input": texts}
+
+                response = await client.post(
+                    self.api_url, json=payload, headers=headers
+                )
+                response.raise_for_status()
+
+                data = response.json()
+
+                # Handle OpenAI-compatible response format
+                if "data" in data:
+                    return [item["embedding"] for item in data["data"]]
+                # Handle direct embedding array response
+                elif "embeddings" in data:
+                    return data["embeddings"]
+                else:
+                    raise ValueError(f"Unexpected API response format: {data}")
+
+        except httpx.HTTPError as e:
+            raise ValueError(f"Embedding API request failed: {str(e)}")
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            raise ValueError(f"Failed to parse embedding API response: {str(e)}")
+
+
 class MilvusConnector:
-    def __init__(self, uri: str, token: Optional[str] = None, db_name: Optional[str] = "default"):
+    def __init__(
+        self, uri: str, token: Optional[str] = None, db_name: Optional[str] = "default"
+    ):
         self.uri = uri
         self.token = token
         self.client = MilvusClient(uri=uri, token=token, db_name=db_name)
@@ -222,7 +343,9 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Failed to create collection: {str(e)}")
 
-    async def insert_data(self, collection_name: str, data: list[dict[str, Any]]) -> dict[str, Any]:
+    async def insert_data(
+        self, collection_name: str, data: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """
         Insert data into a collection.
 
@@ -236,7 +359,9 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Insert failed: {str(e)}")
 
-    async def delete_entities(self, collection_name: str, filter_expr: str) -> dict[str, Any]:
+    async def delete_entities(
+        self, collection_name: str, filter_expr: str
+    ) -> dict[str, Any]:
         """
         Delete entities from a collection based on filter expression.
 
@@ -245,7 +370,9 @@ class MilvusConnector:
             filter_expr: Filter expression to select entities to delete
         """
         try:
-            result = self.client.delete(collection_name=collection_name, expr=filter_expr)
+            result = self.client.delete(
+                collection_name=collection_name, expr=filter_expr
+            )
             return result
         except Exception as e:
             raise ValueError(f"Delete failed: {str(e)}")
@@ -357,16 +484,22 @@ class MilvusConnector:
             total_records = len(data[field_names[0]])
 
             for i in range(0, total_records, batch_size):
-                batch_data = {field: data[field][i : i + batch_size] for field in field_names}
+                batch_data = {
+                    field: data[field][i : i + batch_size] for field in field_names
+                }
 
-                result = self.client.insert(collection_name=collection_name, data=batch_data)
+                result = self.client.insert(
+                    collection_name=collection_name, data=batch_data
+                )
                 results.append(result)
 
             return results
         except Exception as e:
             raise ValueError(f"Bulk insert failed: {str(e)}")
 
-    async def load_collection(self, collection_name: str, replica_number: int = 1) -> bool:
+    async def load_collection(
+        self, collection_name: str, replica_number: int = 1
+    ) -> bool:
         """
         Load a collection into memory for search and query.
 
@@ -407,7 +540,9 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Failed to get query segment info: {str(e)}")
 
-    async def upsert_data(self, collection_name: str, data: dict[str, list[Any]]) -> dict[str, Any]:
+    async def upsert_data(
+        self, collection_name: str, data: dict[str, list[Any]]
+    ) -> dict[str, Any]:
         """
         Upsert data into a collection (insert or update if exists).
 
@@ -438,7 +573,9 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Failed to get index info: {str(e)}")
 
-    async def get_collection_loading_progress(self, collection_name: str) -> dict[str, Any]:
+    async def get_collection_loading_progress(
+        self, collection_name: str
+    ) -> dict[str, Any]:
         """
         Get the loading progress of a collection.
 
@@ -472,8 +609,9 @@ class MilvusConnector:
 
 
 class MilvusContext:
-    def __init__(self, connector: MilvusConnector):
+    def __init__(self, connector: MilvusConnector, embedding_service: EmbeddingService):
         self.connector = connector
+        self.embedding_service = embedding_service
 
 
 @asynccontextmanager
@@ -487,8 +625,14 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[MilvusContext]:
         db_name=config.get("db_name", "default"),
     )
 
+    embedding_service = EmbeddingService(
+        api_url=config.get("embedding_api_url"),
+        model=config.get("embedding_model", "text-embedding-ada-002"),
+        api_key=config.get("embedding_api_key"),
+    )
+
     try:
-        yield MilvusContext(connector)
+        yield MilvusContext(connector, embedding_service)
     finally:
         pass
 
@@ -525,6 +669,56 @@ async def milvus_text_search(
     )
 
     output = f"Search results for '{query_text}' in collection '{collection_name}':\n\n"
+    for result in results:
+        output += f"{result}\n\n"
+
+    return output
+
+
+@mcp.tool()
+async def milvus_semantic_search(
+    collection_name: str,
+    query_text: str,
+    vector_field: str = "vector",
+    limit: int = 5,
+    output_fields: Optional[list[str]] = None,
+    metric_type: str = "COSINE",
+    filter_expr: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Perform semantic search using automatic text embedding.
+    This is the recommended tool for natural language queries.
+
+    Args:
+        collection_name: Name of the collection to search
+        query_text: Natural language query to search for
+        vector_field: Field containing vectors to search (default: "vector")
+        limit: Maximum number of results
+        output_fields: Fields to include in results
+        metric_type: Distance metric (COSINE, L2, IP)
+        filter_expr: Optional filter expression
+    """
+    connector = ctx.request_context.lifespan_context.connector
+    embedding_service = ctx.request_context.lifespan_context.embedding_service
+
+    try:
+        # Automatically generate embedding from query text
+        search_vector = await embedding_service.embed_text(query_text)
+    except ValueError as e:
+        return f"Error: Embedding service not available. {str(e)}\nPlease configure EMBEDDING_API_URL, EMBEDDING_MODEL, and optionally EMBEDDING_API_KEY environment variables."
+
+    results = await connector.vector_search(
+        collection_name=collection_name,
+        vector=search_vector,
+        vector_field=vector_field,
+        limit=limit,
+        output_fields=output_fields,
+        metric_type=metric_type,
+        filter_expr=filter_expr,
+    )
+
+    output = f"Semantic search results for '{query_text}' in '{collection_name}':\n\n"
     for result in results:
         output += f"{result}\n\n"
 
@@ -574,30 +768,49 @@ async def milvus_query(
 @mcp.tool()
 async def milvus_vector_search(
     collection_name: str,
-    vector: list[float],
     vector_field: str = "vector",
     limit: int = 5,
     output_fields: Optional[list[str]] = None,
     metric_type: str = "COSINE",
     filter_expr: Optional[str] = None,
+    vector: Optional[list[float]] = None,
+    query_text: Optional[str] = None,
     ctx: Context = None,
 ) -> str:
     """
     Perform vector similarity search on a collection.
+    Provide either 'vector' directly or 'query_text' for automatic embedding.
 
     Args:
         collection_name: Name of the collection to search
-        vector: Query vector
         vector_field: Field containing vectors to search
         limit: Maximum number of results
         output_fields: Fields to include in results
         metric_type: Distance metric (COSINE, L2, IP)
         filter_expr: Optional filter expression
+        vector: Pre-computed query vector (optional if query_text provided)
+        query_text: Text to automatically embed (optional if vector provided)
     """
     connector = ctx.request_context.lifespan_context.connector
+    embedding_service = ctx.request_context.lifespan_context.embedding_service
+
+    # Determine which vector to use
+    search_vector = vector
+    if search_vector is None and query_text is not None:
+        # Automatically generate embedding from query text
+        try:
+            search_vector = await embedding_service.embed_text(query_text)
+        except ValueError as e:
+            return f"Error generating embedding: {str(e)}\nPlease provide a 'vector' parameter directly or configure the embedding service."
+
+    if search_vector is None:
+        return (
+            "Error: Either 'vector' or 'query_text' must be provided for vector search."
+        )
+
     results = await connector.vector_search(
         collection_name=collection_name,
-        vector=vector,
+        vector=search_vector,
         vector_field=vector_field,
         limit=limit,
         output_fields=output_fields,
@@ -605,7 +818,8 @@ async def milvus_vector_search(
         filter_expr=filter_expr,
     )
 
-    output = f"Vector search results for '{collection_name}':\n\n"
+    query_desc = f"text '{query_text}'" if query_text else "provided vector"
+    output = f"Vector search results for {query_desc} in '{collection_name}':\n\n"
     for result in results:
         output += f"{result}\n\n"
 
@@ -615,42 +829,58 @@ async def milvus_vector_search(
 @mcp.tool()
 async def milvus_hybrid_search(
     collection_name: str,
-    query_text: str,
     text_field: str,
-    vector: list[float],
     vector_field: str,
     limit: int = 5,
     output_fields: Optional[list[str]] = None,
     filter_expr: Optional[str] = None,
+    query_text: Optional[str] = None,
+    vector: Optional[list[float]] = None,
     ctx: Context = None,
 ) -> str:
     """
-    Perform hybrid search combining text and vector search.
+    Perform hybrid search combining BM25 text search and vector search.
+    If only query_text is provided, it will be used for both text search and automatic embedding.
 
     Args:
         collection_name: Name of collection to search
-        query_text: Text query for BM25 search
         text_field: Field name for text search
-        vector: Query vector for dense vector search
         vector_field: Field name for vector search
         limit: Maximum number of results
         output_fields: Fields to return in results
         filter_expr: Optional filter expression
+        query_text: Text query (required for text search, used for auto-embedding if vector not provided)
+        vector: Query vector for dense vector search (optional if query_text provided)
     """
     connector = ctx.request_context.lifespan_context.connector
+    embedding_service = ctx.request_context.lifespan_context.embedding_service
+
+    if query_text is None:
+        return "Error: 'query_text' is required for hybrid search."
+
+    # Determine which vector to use
+    search_vector = vector
+    if search_vector is None:
+        # Automatically generate embedding from query text
+        try:
+            search_vector = await embedding_service.embed_text(query_text)
+        except ValueError as e:
+            return f"Error generating embedding: {str(e)}\nPlease provide a 'vector' parameter directly or configure the embedding service."
 
     results = await connector.hybrid_search(
         collection_name=collection_name,
         query_text=query_text,
         text_field=text_field,
-        vector=vector,
+        vector=search_vector,
         vector_field=vector_field,
         limit=limit,
         output_fields=output_fields,
         filter_expr=filter_expr,
     )
 
-    output = f"Hybrid search results for text '{query_text}' in '{collection_name}':\n\n"
+    output = (
+        f"Hybrid search results for text '{query_text}' in '{collection_name}':\n\n"
+    )
     for result in results:
         output += f"{result}\n\n"
 
@@ -673,7 +903,7 @@ async def milvus_create_collection(
         index_params: Optional index parameters
     """
     connector = ctx.request_context.lifespan_context.connector
-    success = await connector.create_collection(
+    await connector.create_collection(
         collection_name=collection_name,
         schema=collection_schema,
         index_params=index_params,
@@ -684,19 +914,54 @@ async def milvus_create_collection(
 
 @mcp.tool()
 async def milvus_insert_data(
-    collection_name: str, data: list[dict[str, Any]], ctx: Context = None
+    collection_name: str,
+    data: list[dict[str, Any]],
+    text_field: Optional[str] = None,
+    vector_field: Optional[str] = None,
+    auto_embed: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     Insert data into a collection.
+    Optionally auto-generate embeddings from a text field.
 
     Args:
         collection_name: Name of collection
         data: List of dictionaries, each representing a record
+        text_field: Name of the text field to generate embeddings from (if auto_embed=True)
+        vector_field: Name of the vector field to populate with embeddings (if auto_embed=True)
+        auto_embed: Whether to automatically generate embeddings from text_field
     """
     connector = ctx.request_context.lifespan_context.connector
+    embedding_service = ctx.request_context.lifespan_context.embedding_service
+
+    # Handle automatic embedding generation
+    if auto_embed:
+        if not text_field or not vector_field:
+            return "Error: Both 'text_field' and 'vector_field' must be specified when auto_embed=True"
+
+        try:
+            # Extract texts from data
+            texts = []
+            for item in data:
+                if text_field not in item:
+                    return f"Error: text_field '{text_field}' not found in data item: {item}"
+                texts.append(str(item[text_field]))
+
+            # Generate embeddings in batch
+            embeddings = await embedding_service.embed_batch(texts)
+
+            # Add embeddings to data
+            for item, embedding in zip(data, embeddings):
+                item[vector_field] = embedding
+
+        except ValueError as e:
+            return f"Error generating embeddings: {str(e)}\nPlease configure the embedding service or set auto_embed=False"
+
     result = await connector.insert_data(collection_name=collection_name, data=data)
 
-    return f"Data inserted into collection '{collection_name}' with result: {str(result)}"
+    embed_info = " (with auto-generated embeddings)" if auto_embed else ""
+    return f"Data inserted into collection '{collection_name}'{embed_info} with result: {str(result)}"
 
 
 @mcp.tool()
@@ -730,7 +995,7 @@ async def milvus_load_collection(
         replica_number: Number of replicas
     """
     connector = ctx.request_context.lifespan_context.connector
-    success = await connector.load_collection(
+    await connector.load_collection(
         collection_name=collection_name, replica_number=replica_number
     )
 
@@ -746,7 +1011,7 @@ async def milvus_release_collection(collection_name: str, ctx: Context = None) -
         collection_name: Name of collection to release
     """
     connector = ctx.request_context.lifespan_context.connector
-    success = await connector.release_collection(collection_name=collection_name)
+    await connector.release_collection(collection_name=collection_name)
 
     return f"Collection '{collection_name}' released successfully"
 
@@ -768,7 +1033,7 @@ async def milvus_use_database(db_name: str, ctx: Context = None) -> str:
         db_name: Name of the database to use
     """
     connector = ctx.request_context.lifespan_context.connector
-    success = await connector.use_database(db_name)
+    await connector.use_database(db_name)
 
     return f"Switched to database '{db_name}' successfully"
 
@@ -790,14 +1055,36 @@ async def milvus_get_collection_info(collection_name: str, ctx: Context = None) 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Milvus MCP Server")
     parser.add_argument(
-        "--milvus-uri", type=str, default="http://localhost:19530", help="Milvus server URI"
+        "--milvus-uri",
+        type=str,
+        default="http://localhost:19530",
+        help="Milvus server URI",
     )
     parser.add_argument(
         "--milvus-token", type=str, default=None, help="Milvus authentication token"
     )
-    parser.add_argument("--milvus-db", type=str, default="default", help="Milvus database name")
+    parser.add_argument(
+        "--milvus-db", type=str, default="default", help="Milvus database name"
+    )
+    parser.add_argument(
+        "--embedding-api-url",
+        type=str,
+        default=None,
+        help="Embedding API URL (e.g., http://localhost:8081/v1/embeddings)",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="text-embedding-ada-002",
+        help="Embedding model name",
+    )
+    parser.add_argument(
+        "--embedding-api-key", type=str, default=None, help="Embedding API key"
+    )
     parser.add_argument("--sse", action="store_true", help="Enable SSE mode")
-    parser.add_argument("--port", type=int, default=8000, help="Port number for SSE server")
+    parser.add_argument(
+        "--port", type=int, default=8000, help="Port number for SSE server"
+    )
     return parser.parse_args()
 
 
@@ -808,6 +1095,13 @@ def main():
         "milvus_uri": os.environ.get("MILVUS_URI", args.milvus_uri),
         "milvus_token": os.environ.get("MILVUS_TOKEN", args.milvus_token),
         "db_name": os.environ.get("MILVUS_DB", args.milvus_db),
+        "embedding_api_url": os.environ.get(
+            "EMBEDDING_API_URL", args.embedding_api_url
+        ),
+        "embedding_model": os.environ.get("EMBEDDING_MODEL", args.embedding_model),
+        "embedding_api_key": os.environ.get(
+            "EMBEDDING_API_KEY", args.embedding_api_key
+        ),
     }
     if args.sse:
         mcp.run(transport="sse", port=args.port, host="0.0.0.0")
