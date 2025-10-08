@@ -3,16 +3,14 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, List, Optional
+from typing import Annotated, Any, AsyncIterator, List, Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
-from pymilvus import (
-    AnnSearchRequest,
-    MilvusClient,
-    RRFRanker,
-)
+from pydantic import Field
+from pymilvus import AnnSearchRequest, DataType, MilvusClient, RRFRanker
+from pymilvus.exceptions import MilvusException
 
 # Default timeout for all Milvus operations (in seconds)
 DEFAULT_MILVUS_TIMEOUT = 30.0
@@ -137,12 +135,13 @@ class EmbeddingService:
 
 class MilvusConnector:
     def __init__(
-        self, uri: str, token: Optional[str] = None, db_name: Optional[str] = "default"
+        self, uri: str, token: Optional[str] = None, db_name: Optional[str] = "legal"
     ):
         self.uri = uri
         self.token = token
         self.db_name = db_name
         self._client = None
+        self._schema_cache: dict[str, dict[str, Any]] = {}
 
     @property
     def client(self) -> MilvusClient:
@@ -156,16 +155,22 @@ class MilvusConnector:
     async def list_collections(self) -> list[str]:
         """List all collections in the database."""
         try:
-            return self.client.list_collections()
-        except Exception as e:
-            raise ValueError(f"Failed to list collections: {str(e)}")
+            return await asyncio.to_thread(self.client.list_collections)
+        except MilvusException as error:
+            raise self._to_value_error(error)
+        except Exception as error:
+            raise ValueError(f"Failed to list collections: {str(error)}") from error
 
     async def get_collection_info(self, collection_name: str) -> dict:
         """Get detailed information about a collection."""
         try:
-            return self.client.describe_collection(collection_name)
-        except Exception as e:
-            raise ValueError(f"Failed to get collection info: {str(e)}")
+            return await asyncio.to_thread(
+                self.client.describe_collection, collection_name
+            )
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to get collection info: {str(error)}") from error
 
     async def search_collection(
         self,
@@ -174,6 +179,7 @@ class MilvusConnector:
         limit: int = 5,
         output_fields: Optional[list[str]] = None,
         drop_ratio: float = 0.2,
+        text_field: str = "text",
     ) -> list[dict]:
         """
         Perform full text search on a collection.
@@ -184,21 +190,28 @@ class MilvusConnector:
             limit: Maximum number of results
             output_fields: Fields to return in results
             drop_ratio: Proportion of low-frequency terms to ignore (0.0-1.0)
+            text_field: Field name containing textual content
         """
         try:
+            await self._ensure_collection_exists(collection_name)
+            resolved_text_field = await self._resolve_text_field(
+                collection_name, text_field
+            )
             search_params = {"params": {"drop_ratio_search": drop_ratio}}
-
-            results = self.client.search(
+            results = await asyncio.to_thread(
+                self.client.search,
                 collection_name=collection_name,
                 data=[query_text],
-                anns_field="sparse",
+                anns_field=resolved_text_field,
                 limit=limit,
                 output_fields=output_fields,
                 search_params=search_params,
             )
             return results
-        except Exception as e:
-            raise ValueError(f"Search failed: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Search failed: {str(error)}") from error
 
     async def query_collection(
         self,
@@ -209,20 +222,24 @@ class MilvusConnector:
     ) -> list[dict]:
         """Query collection using filter expressions."""
         try:
-            return self.client.query(
+            await self._ensure_collection_exists(collection_name)
+            return await asyncio.to_thread(
+                self.client.query,
                 collection_name=collection_name,
                 filter=filter_expr,
                 output_fields=output_fields,
                 limit=limit,
             )
-        except Exception as e:
-            raise ValueError(f"Query failed: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Query failed: {str(error)}") from error
 
     async def vector_search(
         self,
         collection_name: str,
         vector: list[float],
-        vector_field: str,
+        vector_field: str = "embedding",
         limit: int = 5,
         output_fields: Optional[list[str]] = None,
         metric_type: str = "COSINE",
@@ -241,29 +258,35 @@ class MilvusConnector:
             filter_expr: Optional filter expression
         """
         try:
+            await self._ensure_collection_exists(collection_name)
+            resolved_vector_field = await self._resolve_vector_field(
+                collection_name, vector_field
+            )
             search_params = {"metric_type": metric_type, "params": {"nprobe": 10}}
-
-            results = self.client.search(
+            results = await asyncio.to_thread(
+                self.client.search,
                 collection_name=collection_name,
                 data=[vector],
-                anns_field=vector_field,
+                anns_field=resolved_vector_field,
                 search_params=search_params,
                 limit=limit,
                 output_fields=output_fields,
                 filter=filter_expr,
             )
             return results
-        except Exception as e:
-            raise ValueError(f"Vector search failed: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Vector search failed: {str(error)}") from error
 
     async def hybrid_search(
         self,
         collection_name: str,
         query_text: str,
-        text_field: str,
-        vector: List[float],
-        vector_field: str,
-        limit: int,
+        text_field: str = "text",
+        vector: list[float] | None = None,
+        vector_field: str = "embedding",
+        limit: int = 5,
         output_fields: Optional[list[str]] = None,
         filter_expr: Optional[str] = None,
     ) -> list[dict]:
@@ -281,24 +304,32 @@ class MilvusConnector:
             filter_expr: Optional filter expression
         """
         try:
-            sparse_params = {"params": {"nprobe": 10}}
-            dense_params = {"params": {"drop_ratio_build": 0.2}}
+            await self._ensure_collection_exists(collection_name)
+            resolved_text_field = await self._resolve_text_field(
+                collection_name, text_field
+            )
+            resolved_vector_field = await self._resolve_vector_field(
+                collection_name, vector_field
+            )
+            sparse_params = {"params": {"drop_ratio_search": 0.2}}
+            dense_params = {"params": {"nprobe": 10}}
             # BM25 search request
             sparse_request = AnnSearchRequest(
                 data=[query_text],
-                anns_field=text_field,
+                anns_field=resolved_text_field,
                 param=sparse_params,
                 limit=limit,
             )
             # dense vector search request
             dense_request = AnnSearchRequest(
                 data=[vector],
-                anns_field=vector_field,
+                anns_field=resolved_vector_field,
                 param=dense_params,
                 limit=limit,
             )
             # hybrid search
-            results = self.client.hybrid_search(
+            results = await asyncio.to_thread(
+                self.client.hybrid_search,
                 collection_name=collection_name,
                 reqs=[sparse_request, dense_request],
                 ranker=RRFRanker(60),
@@ -309,8 +340,10 @@ class MilvusConnector:
 
             return results
 
-        except Exception as e:
-            raise ValueError(f"Hybrid search failed: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Hybrid search failed: {str(error)}") from error
 
     async def get_collection_stats(self, collection_name: str) -> dict[str, Any]:
         """
@@ -320,15 +353,20 @@ class MilvusConnector:
             collection_name: Name of collection
         """
         try:
-            return self.client.get_collection_stats(collection_name)
-        except Exception as e:
-            raise ValueError(f"Failed to get collection stats: {str(e)}")
+            await self._ensure_collection_exists(collection_name)
+            return await asyncio.to_thread(
+                self.client.get_collection_stats, collection_name
+            )
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to get collection stats: {str(error)}") from error
 
     async def multi_vector_search(
         self,
         collection_name: str,
         vectors: list[list[float]],
-        vector_field: str,
+        vector_field: str = "embedding",
         limit: int = 5,
         output_fields: Optional[list[str]] = None,
         metric_type: str = "COSINE",
@@ -349,21 +387,27 @@ class MilvusConnector:
             search_params: Additional search parameters
         """
         try:
+            await self._ensure_collection_exists(collection_name)
             if search_params is None:
                 search_params = {"metric_type": metric_type, "params": {"nprobe": 10}}
-
-            results = self.client.search(
+            resolved_vector_field = await self._resolve_vector_field(
+                collection_name, vector_field
+            )
+            results = await asyncio.to_thread(
+                self.client.search,
                 collection_name=collection_name,
                 data=vectors,
-                anns_field=vector_field,
+                anns_field=resolved_vector_field,
                 search_params=search_params,
                 limit=limit,
                 output_fields=output_fields,
                 filter=filter_expr,
             )
             return results
-        except Exception as e:
-            raise ValueError(f"Multi-vector search failed: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Multi-vector search failed: {str(error)}") from error
 
     async def load_collection(
         self, collection_name: str, replica_number: int = 1
@@ -376,12 +420,17 @@ class MilvusConnector:
             replica_number: Number of replicas
         """
         try:
-            self.client.load_collection(
-                collection_name=collection_name, replica_number=replica_number
+            await self._ensure_collection_exists(collection_name)
+            await asyncio.to_thread(
+                self.client.load_collection,
+                collection_name=collection_name,
+                replica_number=replica_number,
             )
             return True
-        except Exception as e:
-            raise ValueError(f"Failed to load collection: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to load collection: {str(error)}") from error
 
     async def release_collection(self, collection_name: str) -> bool:
         """
@@ -391,10 +440,15 @@ class MilvusConnector:
             collection_name: Name of collection to release
         """
         try:
-            self.client.release_collection(collection_name=collection_name)
+            await self._ensure_collection_exists(collection_name)
+            await asyncio.to_thread(
+                self.client.release_collection, collection_name=collection_name
+            )
             return True
-        except Exception as e:
-            raise ValueError(f"Failed to release collection: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to release collection: {str(error)}") from error
 
     async def get_query_segment_info(self, collection_name: str) -> dict[str, Any]:
         """
@@ -404,9 +458,16 @@ class MilvusConnector:
             collection_name: Name of collection
         """
         try:
-            return self.client.get_query_segment_info(collection_name)
-        except Exception as e:
-            raise ValueError(f"Failed to get query segment info: {str(e)}")
+            await self._ensure_collection_exists(collection_name)
+            return await asyncio.to_thread(
+                self.client.get_query_segment_info, collection_name
+            )
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(
+                f"Failed to get query segment info: {str(error)}"
+            ) from error
 
     async def get_index_info(
         self, collection_name: str, field_name: Optional[str] = None
@@ -419,11 +480,16 @@ class MilvusConnector:
             field_name: Optional specific field to get index info for
         """
         try:
-            return self.client.describe_index(
-                collection_name=collection_name, index_name=field_name
+            await self._ensure_collection_exists(collection_name)
+            return await asyncio.to_thread(
+                self.client.describe_index,
+                collection_name=collection_name,
+                index_name=field_name,
             )
-        except Exception as e:
-            raise ValueError(f"Failed to get index info: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to get index info: {str(error)}") from error
 
     async def get_collection_loading_progress(
         self, collection_name: str
@@ -435,16 +501,21 @@ class MilvusConnector:
             collection_name: Name of collection
         """
         try:
-            return self.client.get_load_state(collection_name)
-        except Exception as e:
-            raise ValueError(f"Failed to get loading progress: {str(e)}")
+            await self._ensure_collection_exists(collection_name)
+            return await asyncio.to_thread(self.client.get_load_state, collection_name)
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(f"Failed to get loading progress: {str(error)}") from error
 
     async def list_databases(self) -> list[str]:
         """List all databases in the Milvus instance."""
         try:
-            return self.client.list_databases()
-        except Exception as e:
-            raise ValueError(f"Failed to list databases: {str(e)}")
+            return await asyncio.to_thread(self.client.list_databases)
+        except MilvusException as error:
+            raise self._to_value_error(error)
+        except Exception as error:
+            raise ValueError(f"Failed to list databases: {str(error)}") from error
 
     async def use_database(self, db_name: str) -> bool:
         """Switch to a different database.
@@ -454,11 +525,150 @@ class MilvusConnector:
         """
         try:
             # Update db_name and reset client for lazy re-initialization
+            if self._client is not None and hasattr(self._client, "close"):
+                await asyncio.to_thread(self._client.close)
             self.db_name = db_name
             self._client = None  # Reset client to reconnect with new database
+            self._schema_cache.clear()
             return True
-        except Exception as e:
-            raise ValueError(f"Failed to switch database: {str(e)}")
+        except MilvusException as error:
+            raise self._to_value_error(error)
+        except Exception as error:
+            raise ValueError(f"Failed to switch database: {str(error)}") from error
+
+    async def _get_collection_schema(self, collection_name: str) -> dict[str, Any]:
+        """Retrieve and cache the collection schema."""
+        if collection_name not in self._schema_cache:
+            try:
+                schema = await asyncio.to_thread(
+                    self.client.describe_collection, collection_name
+                )
+            except MilvusException as error:
+                raise self._to_value_error(error, collection_name)
+            except Exception as error:
+                raise ValueError(f"Failed to retrieve schema: {str(error)}") from error
+            self._schema_cache[collection_name] = schema
+        return self._schema_cache[collection_name]
+
+    async def _resolve_vector_field(
+        self, collection_name: str, requested_field: str
+    ) -> str:
+        """Resolve the appropriate vector field for a collection."""
+        schema = await self._get_collection_schema(collection_name)
+        field_name = self._choose_field(
+            schema,
+            requested_field,
+            candidates=[requested_field, "embedding", "vector", "dense_vector"],
+            expected_type=DataType.FLOAT_VECTOR,
+        )
+        if field_name is None:
+            raise ValueError(
+                f"No FLOAT_VECTOR field available in collection '{collection_name}'."
+            )
+        return field_name
+
+    async def _resolve_text_field(
+        self, collection_name: str, requested_field: str
+    ) -> str:
+        """Resolve the appropriate sparse vector field for BM25 text search."""
+        schema = await self._get_collection_schema(collection_name)
+        field_name = self._choose_field(
+            schema,
+            requested_field,
+            candidates=[requested_field, "sparse", "sparse_vector", "text_sparse"],
+            expected_type=DataType.SPARSE_FLOAT_VECTOR,
+        )
+        if field_name is None:
+            raise ValueError(
+                f"No SPARSE_FLOAT_VECTOR field available for text search in collection '{collection_name}'."
+            )
+        return field_name
+
+    @staticmethod
+    def _choose_field(
+        schema: dict[str, Any],
+        requested_field: str,
+        candidates: list[str],
+        expected_type: DataType,
+    ) -> Optional[str]:
+        """Select the first matching field from candidates that exists in the schema."""
+
+        # Schema from describe_collection has fields directly, not under schema.fields
+        fields = schema.get("fields", [])
+
+        def matches(field: dict[str, Any], name: str) -> bool:
+            if field.get("name") != name:
+                return False
+            # The type field contains the integer enum value
+            field_type = field.get("type")
+            # Compare integer type values
+            if isinstance(field_type, int):
+                return field_type == expected_type.value
+            elif isinstance(field_type, DataType):
+                return field_type == expected_type
+            return False
+
+        # Ensure requested field is evaluated first
+        seen = set()
+        ordered_candidates = []
+        for candidate in candidates:
+            if candidate not in seen and candidate is not None:
+                ordered_candidates.append(candidate)
+                seen.add(candidate)
+
+        for candidate in ordered_candidates:
+            for field in fields:
+                if matches(field, candidate):
+                    return candidate
+
+        # Fall back to any field of the expected type if specific names not found
+        for field in fields:
+            field_type = field.get("type")
+            # Compare integer type values
+            if isinstance(field_type, int) and field_type == expected_type.value:
+                return field.get("name")
+            elif isinstance(field_type, DataType) and field_type == expected_type:
+                return field.get("name")
+
+        return None
+
+    async def _ensure_collection_exists(self, collection_name: str) -> None:
+        """Ensure the target collection exists before running an operation."""
+
+        try:
+            exists = await asyncio.to_thread(
+                self.client.has_collection, collection_name
+            )
+        except MilvusException as error:
+            raise self._to_value_error(error, collection_name)
+        except Exception as error:
+            raise ValueError(
+                f"Failed to verify collection existence: {str(error)}"
+            ) from error
+
+        if not exists:
+            raise ValueError(f"collection_not_found: '{collection_name}'")
+
+    @staticmethod
+    def _is_collection_missing(error: MilvusException) -> bool:
+        """Check if the provided error indicates a missing collection."""
+
+        message = str(error).lower()
+        code = getattr(error, "code", None)
+        return code == 1100 or "not found" in message or "does not exist" in message
+
+    def _to_value_error(
+        self, error: Exception, collection_name: Optional[str] = None
+    ) -> ValueError:
+        """Convert low-level exceptions into normalized ValueError instances."""
+
+        if isinstance(error, MilvusException):
+            if self._is_collection_missing(error):
+                if collection_name is not None:
+                    return ValueError(f"collection_not_found: '{collection_name}'")
+                return ValueError("collection_not_found")
+            return ValueError(f"Milvus error: {str(error)}")
+        return ValueError(str(error))
 
 
 class MilvusContext:
@@ -501,7 +711,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[MilvusContext]:
     connector = MilvusConnector(
         uri=config.get("milvus_uri", "http://localhost:19530"),
         token=config.get("milvus_token"),
-        db_name=config.get("db_name", "default"),
+        db_name=config.get("db_name", "legal"),
     )
 
     embedding_service = EmbeddingService(
@@ -521,24 +731,44 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[MilvusContext]:
 mcp = FastMCP(name="Milvus", lifespan=server_lifespan)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_text_search(
-    collection_name: str,
-    query_text: str,
-    limit: int = 5,
-    output_fields: Optional[list[str]] = None,
-    drop_ratio: float = 0.2,
-    ctx: Context = None,
+    collection_name: Annotated[
+        str, Field(description="Name of the collection to search")
+    ],
+    query_text: Annotated[
+        str, Field(description="Text query for BM25 full-text search")
+    ],
+    ctx: Context,
+    limit: Annotated[
+        int, Field(description="Maximum number of results to return", ge=1, le=100)
+    ] = 5,
+    output_fields: Annotated[
+        list[str] | None, Field(description="Fields to include in results")
+    ] = None,
+    drop_ratio: Annotated[
+        float,
+        Field(
+            description="Proportion of low-frequency terms to ignore (0.0-1.0)",
+            ge=0.0,
+            le=1.0,
+        ),
+    ] = 0.2,
+    text_field: Annotated[
+        str, Field(description="Name of the sparse vector field for BM25 search")
+    ] = "sparse",
 ) -> str:
     """
-    Search for documents using full text search in a Milvus collection.
+    Search for documents using full text search (BM25) in a Milvus collection.
 
     Args:
         collection_name: Name of the collection to search
         query_text: Text to search for
+        ctx: FastMCP context
         limit: Maximum number of results to return
         output_fields: Fields to include in results
         drop_ratio: Proportion of low-frequency terms to ignore (0.0-1.0)
+        text_field: Name of the sparse vector field for BM25 search
     """
     context = ctx.request_context.lifespan_context
     connector = context.connector
@@ -550,6 +780,7 @@ async def milvus_text_search(
             limit=limit,
             output_fields=output_fields,
             drop_ratio=drop_ratio,
+            text_field=text_field,
         ),
         context.timeout,
         "text_search",
@@ -562,16 +793,30 @@ async def milvus_text_search(
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_semantic_search(
-    collection_name: str,
-    query_text: str,
-    vector_field: str = "vector",
-    limit: int = 5,
-    output_fields: Optional[list[str]] = None,
-    metric_type: str = "COSINE",
-    filter_expr: Optional[str] = None,
-    ctx: Context = None,
+    collection_name: Annotated[
+        str, Field(description="Name of the collection to search")
+    ],
+    query_text: Annotated[
+        str, Field(description="Natural language query for semantic search")
+    ],
+    ctx: Context,
+    vector_field: Annotated[
+        str, Field(description="Field containing vectors to search")
+    ] = "embedding",
+    limit: Annotated[
+        int, Field(description="Maximum number of results to return", ge=1, le=100)
+    ] = 5,
+    output_fields: Annotated[
+        list[str] | None, Field(description="Fields to include in results")
+    ] = None,
+    metric_type: Annotated[
+        str, Field(description="Distance metric: COSINE, L2, or IP")
+    ] = "COSINE",
+    filter_expr: Annotated[
+        str | None, Field(description="Optional filter expression")
+    ] = None,
 ) -> str:
     """
     Perform semantic search using automatic text embedding.
@@ -580,7 +825,8 @@ async def milvus_semantic_search(
     Args:
         collection_name: Name of the collection to search
         query_text: Natural language query to search for
-        vector_field: Field containing vectors to search (default: "vector")
+        ctx: FastMCP context
+        vector_field: Field containing vectors to search (default: "embedding")
         limit: Maximum number of results
         output_fields: Fields to include in results
         metric_type: Distance metric (COSINE, L2, IP)
@@ -623,9 +869,9 @@ async def milvus_semantic_search(
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_list_collections(ctx: Context) -> str:
-    """List all collections in the database."""
+    """List all collections in the current Milvus database."""
     context = ctx.request_context.lifespan_context
     connector = context.connector
 
@@ -637,16 +883,25 @@ async def milvus_list_collections(ctx: Context) -> str:
     return f"Collections in database:\n{', '.join(collections)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_query(
-    collection_name: str,
-    filter_expr: str,
-    output_fields: Optional[list[str]] = None,
-    limit: int = 10,
-    ctx: Context = None,
+    collection_name: Annotated[
+        str, Field(description="Name of the collection to query")
+    ],
+    filter_expr: Annotated[
+        str,
+        Field(description="Filter expression (e.g. 'age > 20' or 'id in [1, 2, 3]')"),
+    ],
+    ctx: Context,
+    output_fields: Annotated[
+        list[str] | None, Field(description="Fields to include in results")
+    ] = None,
+    limit: Annotated[
+        int, Field(description="Maximum number of results", ge=1, le=1000)
+    ] = 10,
 ) -> str:
     """
-    Query collection using filter expressions.
+    Query collection using filter expressions to retrieve records matching specific criteria.
 
     Args:
         collection_name: Name of the collection to query
@@ -675,17 +930,33 @@ async def milvus_query(
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_vector_search(
-    collection_name: str,
-    vector_field: str = "vector",
-    limit: int = 5,
-    output_fields: Optional[list[str]] = None,
-    metric_type: str = "COSINE",
-    filter_expr: Optional[str] = None,
-    vector: Optional[list[float]] = None,
-    query_text: Optional[str] = None,
-    ctx: Context = None,
+    collection_name: Annotated[
+        str, Field(description="Name of the collection to search")
+    ],
+    ctx: Context,
+    vector_field: Annotated[
+        str, Field(description="Field containing vectors to search")
+    ] = "embedding",
+    limit: Annotated[
+        int, Field(description="Maximum number of results to return", ge=1, le=100)
+    ] = 5,
+    output_fields: Annotated[
+        list[str] | None, Field(description="Fields to include in results")
+    ] = None,
+    metric_type: Annotated[
+        str, Field(description="Distance metric: COSINE, L2, or IP")
+    ] = "COSINE",
+    filter_expr: Annotated[
+        str | None, Field(description="Optional filter expression")
+    ] = None,
+    vector: Annotated[
+        list[float] | None, Field(description="Pre-computed query vector")
+    ] = None,
+    query_text: Annotated[
+        str | None, Field(description="Text to automatically embed as query vector")
+    ] = None,
 ) -> str:
     """
     Perform vector similarity search on a collection.
@@ -747,38 +1018,53 @@ async def milvus_vector_search(
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def milvus_hybrid_search(
-    collection_name: str,
-    text_field: str,
-    vector_field: str,
-    limit: int = 5,
-    output_fields: Optional[list[str]] = None,
-    filter_expr: Optional[str] = None,
-    query_text: Optional[str] = None,
-    vector: Optional[list[float]] = None,
-    ctx: Context = None,
+    collection_name: Annotated[str, Field(description="Name of collection to search")],
+    query_text: Annotated[
+        str, Field(description="Text query for both BM25 and semantic search")
+    ],
+    ctx: Context,
+    text_field: Annotated[
+        str, Field(description="Name of the sparse vector field for BM25 search")
+    ] = "sparse",
+    vector_field: Annotated[
+        str, Field(description="Field containing dense vectors for semantic search")
+    ] = "embedding",
+    limit: Annotated[
+        int, Field(description="Maximum number of results to return", ge=1, le=100)
+    ] = 5,
+    output_fields: Annotated[
+        list[str] | None, Field(description="Fields to include in results")
+    ] = None,
+    filter_expr: Annotated[
+        str | None, Field(description="Optional filter expression")
+    ] = None,
+    vector: Annotated[
+        list[float] | None,
+        Field(
+            description="Optional pre-computed query vector (auto-generated if not provided)"
+        ),
+    ] = None,
 ) -> str:
     """
-    Perform hybrid search combining BM25 text search and vector search.
+    Perform hybrid search combining BM25 text search and vector search with RRF ranking.
     If only query_text is provided, it will be used for both text search and automatic embedding.
 
     Args:
         collection_name: Name of collection to search
-        text_field: Field name for text search
-        vector_field: Field name for vector search
+        query_text: Text query for both BM25 and semantic search
+        ctx: FastMCP context
+        text_field: Name of the sparse vector field for BM25 search
+        vector_field: Field name for dense vector search
         limit: Maximum number of results
         output_fields: Fields to return in results
         filter_expr: Optional filter expression
-        query_text: Text query (required for text search, used for auto-embedding if vector not provided)
-        vector: Query vector for dense vector search (optional if query_text provided)
+        vector: Query vector for dense vector search (optional, auto-generated if not provided)
     """
     context = ctx.request_context.lifespan_context
     connector = context.connector
     embedding_service = context.embedding_service
-
-    if query_text is None:
-        return "Error: 'query_text' is required for hybrid search."
 
     # Determine which vector to use
     search_vector = vector
@@ -819,15 +1105,22 @@ async def milvus_hybrid_search(
     return output
 
 
-@mcp.tool()
+@mcp.tool
 async def milvus_load_collection(
-    collection_name: str, replica_number: int = 1, ctx: Context = None
+    collection_name: Annotated[
+        str, Field(description="Name of collection to load into memory")
+    ],
+    ctx: Context,
+    replica_number: Annotated[
+        int, Field(description="Number of replicas to load", ge=1)
+    ] = 1,
 ) -> str:
     """
-    Load a collection into memory for search and query.
+    Load a collection into memory for search and query operations.
 
     Args:
         collection_name: Name of collection to load
+        ctx: FastMCP context
         replica_number: Number of replicas
     """
     context = ctx.request_context.lifespan_context
@@ -844,13 +1137,19 @@ async def milvus_load_collection(
     return f"Collection '{collection_name}' loaded successfully with {replica_number} replica(s)"
 
 
-@mcp.tool()
-async def milvus_release_collection(collection_name: str, ctx: Context = None) -> str:
+@mcp.tool
+async def milvus_release_collection(
+    collection_name: Annotated[
+        str, Field(description="Name of collection to release from memory")
+    ],
+    ctx: Context,
+) -> str:
     """
-    Release a collection from memory.
+    Release a collection from memory to free up resources.
 
     Args:
         collection_name: Name of collection to release
+        ctx: FastMCP context
     """
     context = ctx.request_context.lifespan_context
     connector = context.connector
@@ -864,8 +1163,8 @@ async def milvus_release_collection(collection_name: str, ctx: Context = None) -
     return f"Collection '{collection_name}' released successfully"
 
 
-@mcp.tool()
-async def milvus_list_databases(ctx: Context = None) -> str:
+@mcp.tool(annotations={"readOnlyHint": True})
+async def milvus_list_databases(ctx: Context) -> str:
     """List all databases in the Milvus instance."""
     context = ctx.request_context.lifespan_context
     connector = context.connector
@@ -878,13 +1177,17 @@ async def milvus_list_databases(ctx: Context = None) -> str:
     return f"Databases in Milvus instance:\n{', '.join(databases)}"
 
 
-@mcp.tool()
-async def milvus_use_database(db_name: str, ctx: Context = None) -> str:
+@mcp.tool
+async def milvus_use_database(
+    db_name: Annotated[str, Field(description="Name of the database to switch to")],
+    ctx: Context,
+) -> str:
     """
-    Switch to a different database.
+    Switch to a different database context.
 
     Args:
         db_name: Name of the database to use
+        ctx: FastMCP context
     """
     context = ctx.request_context.lifespan_context
     connector = context.connector
@@ -898,13 +1201,19 @@ async def milvus_use_database(db_name: str, ctx: Context = None) -> str:
     return f"Switched to database '{db_name}' successfully"
 
 
-@mcp.tool()
-async def milvus_get_collection_info(collection_name: str, ctx: Context = None) -> str:
+@mcp.tool(annotations={"readOnlyHint": True})
+async def milvus_get_collection_info(
+    collection_name: Annotated[
+        str, Field(description="Name of collection to get information about")
+    ],
+    ctx: Context,
+) -> str:
     """
-    Lists detailed information about a specific collection
+    Get detailed schema and metadata information about a specific collection.
 
     Args:
-        collection_name: Name of collection to load
+        collection_name: Name of collection to inspect
+        ctx: FastMCP context
     """
     context = ctx.request_context.lifespan_context
     connector = context.connector
@@ -914,8 +1223,7 @@ async def milvus_get_collection_info(collection_name: str, ctx: Context = None) 
         context.timeout,
         "get_collection_info",
     )
-    info_str = json.dumps(collection_info, indent=2)
-    return f"Collection information:\n{info_str}"
+    return f"Collection information:\n{collection_info}"
 
 
 def parse_arguments():
@@ -930,7 +1238,7 @@ def parse_arguments():
         "--milvus-token", type=str, default=None, help="Milvus authentication token"
     )
     parser.add_argument(
-        "--milvus-db", type=str, default="default", help="Milvus database name"
+        "--milvus-db", type=str, default="legal", help="Milvus database name"
     )
     parser.add_argument(
         "--milvus-timeout",
