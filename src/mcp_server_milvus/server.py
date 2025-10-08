@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -9,10 +10,12 @@ from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from pymilvus import (
     AnnSearchRequest,
-    DataType,
     MilvusClient,
     RRFRanker,
 )
+
+# Default timeout for all Milvus operations (in seconds)
+DEFAULT_MILVUS_TIMEOUT = 30.0
 
 
 class EmbeddingService:
@@ -138,7 +141,17 @@ class MilvusConnector:
     ):
         self.uri = uri
         self.token = token
-        self.client = MilvusClient(uri=uri, token=token, db_name=db_name)
+        self.db_name = db_name
+        self._client = None
+
+    @property
+    def client(self) -> MilvusClient:
+        """Lazy initialization of Milvus client."""
+        if self._client is None:
+            self._client = MilvusClient(
+                uri=self.uri, token=self.token, db_name=self.db_name
+            )
+        return self._client
 
     async def list_collections(self) -> list[str]:
         """List all collections in the database."""
@@ -299,84 +312,6 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Hybrid search failed: {str(e)}")
 
-    async def create_collection(
-        self,
-        collection_name: str,
-        schema: dict[str, Any],
-        index_params: Optional[dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Create a new collection with the specified schema.
-
-        Args:
-            collection_name: Name for the new collection
-            schema: Collection schema definition
-            index_params: Optional index parameters
-        """
-        try:
-            # Check if collection already exists
-            if collection_name in self.client.list_collections():
-                raise ValueError(f"Collection '{collection_name}' already exists")
-
-            # Create collection
-            self.client.create_collection(
-                collection_name=collection_name,
-                dimension=schema.get("dimension", 128),
-                primary_field=schema.get("primary_field", "id"),
-                id_type=schema.get("id_type", DataType.INT64),
-                vector_field=schema.get("vector_field", "vector"),
-                metric_type=schema.get("metric_type", "COSINE"),
-                auto_id=schema.get("auto_id", False),
-                enable_dynamic_field=schema.get("enable_dynamic_field", True),
-                other_fields=schema.get("other_fields", []),
-            )
-
-            # Create index if params provided
-            if index_params:
-                self.client.create_index(
-                    collection_name=collection_name,
-                    field_name=schema.get("vector_field", "vector"),
-                    index_params=index_params,
-                )
-
-            return True
-        except Exception as e:
-            raise ValueError(f"Failed to create collection: {str(e)}")
-
-    async def insert_data(
-        self, collection_name: str, data: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        """
-        Insert data into a collection.
-
-        Args:
-            collection_name: Name of collection
-            data: List of dictionaries, each representing a record
-        """
-        try:
-            result = self.client.insert(collection_name=collection_name, data=data)
-            return result
-        except Exception as e:
-            raise ValueError(f"Insert failed: {str(e)}")
-
-    async def delete_entities(
-        self, collection_name: str, filter_expr: str
-    ) -> dict[str, Any]:
-        """
-        Delete entities from a collection based on filter expression.
-
-        Args:
-            collection_name: Name of collection
-            filter_expr: Filter expression to select entities to delete
-        """
-        try:
-            result = self.client.delete(
-                collection_name=collection_name, expr=filter_expr
-            )
-            return result
-        except Exception as e:
-            raise ValueError(f"Delete failed: {str(e)}")
-
     async def get_collection_stats(self, collection_name: str) -> dict[str, Any]:
         """
         Get statistics about a collection.
@@ -430,73 +365,6 @@ class MilvusConnector:
         except Exception as e:
             raise ValueError(f"Multi-vector search failed: {str(e)}")
 
-    async def create_index(
-        self,
-        collection_name: str,
-        field_name: str,
-        index_type: str = "IVF_FLAT",
-        metric_type: str = "COSINE",
-        params: Optional[dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Create an index on a vector field.
-
-        Args:
-            collection_name: Name of collection
-            field_name: Field to index
-            index_type: Type of index (IVF_FLAT, HNSW, etc.)
-            metric_type: Distance metric (COSINE, L2, IP)
-            params: Additional index parameters
-        """
-        try:
-            if params is None:
-                params = {"nlist": 1024}
-
-            index_params = {
-                "index_type": index_type,
-                "metric_type": metric_type,
-                "params": params,
-            }
-
-            self.client.create_index(
-                collection_name=collection_name,
-                field_name=field_name,
-                index_params=index_params,
-            )
-            return True
-        except Exception as e:
-            raise ValueError(f"Failed to create index: {str(e)}")
-
-    async def bulk_insert(
-        self, collection_name: str, data: dict[str, list[Any]], batch_size: int = 1000
-    ) -> list[dict[str, Any]]:
-        """
-        Insert data in batches for better performance.
-
-        Args:
-            collection_name: Name of collection
-            data: Dictionary mapping field names to lists of values
-            batch_size: Number of records per batch
-        """
-        try:
-            results = []
-            field_names = list(data.keys())
-            total_records = len(data[field_names[0]])
-
-            for i in range(0, total_records, batch_size):
-                batch_data = {
-                    field: data[field][i : i + batch_size] for field in field_names
-                }
-
-                result = self.client.insert(
-                    collection_name=collection_name, data=batch_data
-                )
-                results.append(result)
-
-            return results
-        except Exception as e:
-            raise ValueError(f"Bulk insert failed: {str(e)}")
-
     async def load_collection(
         self, collection_name: str, replica_number: int = 1
     ) -> bool:
@@ -539,22 +407,6 @@ class MilvusConnector:
             return self.client.get_query_segment_info(collection_name)
         except Exception as e:
             raise ValueError(f"Failed to get query segment info: {str(e)}")
-
-    async def upsert_data(
-        self, collection_name: str, data: dict[str, list[Any]]
-    ) -> dict[str, Any]:
-        """
-        Upsert data into a collection (insert or update if exists).
-
-        Args:
-            collection_name: Name of collection
-            data: Dictionary mapping field names to lists of values
-        """
-        try:
-            result = self.client.upsert(collection_name=collection_name, data=data)
-            return result
-        except Exception as e:
-            raise ValueError(f"Upsert failed: {str(e)}")
 
     async def get_index_info(
         self, collection_name: str, field_name: Optional[str] = None
@@ -601,17 +453,44 @@ class MilvusConnector:
             db_name: Name of the database to use
         """
         try:
-            # Create a new client with the specified database
-            self.client = MilvusClient(uri=self.uri, token=self.token, db_name=db_name)
+            # Update db_name and reset client for lazy re-initialization
+            self.db_name = db_name
+            self._client = None  # Reset client to reconnect with new database
             return True
         except Exception as e:
             raise ValueError(f"Failed to switch database: {str(e)}")
 
 
 class MilvusContext:
-    def __init__(self, connector: MilvusConnector, embedding_service: EmbeddingService):
+    def __init__(
+        self,
+        connector: MilvusConnector,
+        embedding_service: EmbeddingService,
+        timeout: float = DEFAULT_MILVUS_TIMEOUT,
+    ):
         self.connector = connector
         self.embedding_service = embedding_service
+        self.timeout = timeout
+
+
+async def with_timeout(coro, timeout: float, operation_name: str):
+    """
+    Wrap a coroutine with a timeout.
+
+    Args:
+        coro: The coroutine to execute
+        timeout: Timeout in seconds
+        operation_name: Name of the operation for error messages
+
+    Raises:
+        TimeoutError: If the operation exceeds the timeout
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"Milvus operation '{operation_name}' timed out after {timeout} seconds"
+        )
 
 
 @asynccontextmanager
@@ -631,8 +510,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[MilvusContext]:
         api_key=config.get("embedding_api_key"),
     )
 
+    timeout = config.get("milvus_timeout", DEFAULT_MILVUS_TIMEOUT)
+
     try:
-        yield MilvusContext(connector, embedding_service)
+        yield MilvusContext(connector, embedding_service, timeout)
     finally:
         pass
 
@@ -659,13 +540,19 @@ async def milvus_text_search(
         output_fields: Fields to include in results
         drop_ratio: Proportion of low-frequency terms to ignore (0.0-1.0)
     """
-    connector = ctx.request_context.lifespan_context.connector
-    results = await connector.search_collection(
-        collection_name=collection_name,
-        query_text=query_text,
-        limit=limit,
-        output_fields=output_fields,
-        drop_ratio=drop_ratio,
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    results = await with_timeout(
+        connector.search_collection(
+            collection_name=collection_name,
+            query_text=query_text,
+            limit=limit,
+            output_fields=output_fields,
+            drop_ratio=drop_ratio,
+        ),
+        context.timeout,
+        "text_search",
     )
 
     output = f"Search results for '{query_text}' in collection '{collection_name}':\n\n"
@@ -699,23 +586,34 @@ async def milvus_semantic_search(
         metric_type: Distance metric (COSINE, L2, IP)
         filter_expr: Optional filter expression
     """
-    connector = ctx.request_context.lifespan_context.connector
-    embedding_service = ctx.request_context.lifespan_context.embedding_service
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+    embedding_service = context.embedding_service
 
     try:
         # Automatically generate embedding from query text
-        search_vector = await embedding_service.embed_text(query_text)
+        search_vector = await with_timeout(
+            embedding_service.embed_text(query_text),
+            context.timeout,
+            "embed_text",
+        )
     except ValueError as e:
         return f"Error: Embedding service not available. {str(e)}\nPlease configure EMBEDDING_API_URL, EMBEDDING_MODEL, and optionally EMBEDDING_API_KEY environment variables."
+    except TimeoutError as e:
+        return f"Error: {str(e)}"
 
-    results = await connector.vector_search(
-        collection_name=collection_name,
-        vector=search_vector,
-        vector_field=vector_field,
-        limit=limit,
-        output_fields=output_fields,
-        metric_type=metric_type,
-        filter_expr=filter_expr,
+    results = await with_timeout(
+        connector.vector_search(
+            collection_name=collection_name,
+            vector=search_vector,
+            vector_field=vector_field,
+            limit=limit,
+            output_fields=output_fields,
+            metric_type=metric_type,
+            filter_expr=filter_expr,
+        ),
+        context.timeout,
+        "semantic_search",
     )
 
     output = f"Semantic search results for '{query_text}' in '{collection_name}':\n\n"
@@ -728,8 +626,14 @@ async def milvus_semantic_search(
 @mcp.tool()
 async def milvus_list_collections(ctx: Context) -> str:
     """List all collections in the database."""
-    connector = ctx.request_context.lifespan_context.connector
-    collections = await connector.list_collections()
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    collections = await with_timeout(
+        connector.list_collections(),
+        context.timeout,
+        "list_collections",
+    )
     return f"Collections in database:\n{', '.join(collections)}"
 
 
@@ -750,12 +654,18 @@ async def milvus_query(
         output_fields: Fields to include in results
         limit: Maximum number of results
     """
-    connector = ctx.request_context.lifespan_context.connector
-    results = await connector.query_collection(
-        collection_name=collection_name,
-        filter_expr=filter_expr,
-        output_fields=output_fields,
-        limit=limit,
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    results = await with_timeout(
+        connector.query_collection(
+            collection_name=collection_name,
+            filter_expr=filter_expr,
+            output_fields=output_fields,
+            limit=limit,
+        ),
+        context.timeout,
+        "query",
     )
 
     output = f"Query results for '{filter_expr}' in collection '{collection_name}':\n\n"
@@ -791,31 +701,42 @@ async def milvus_vector_search(
         vector: Pre-computed query vector (optional if query_text provided)
         query_text: Text to automatically embed (optional if vector provided)
     """
-    connector = ctx.request_context.lifespan_context.connector
-    embedding_service = ctx.request_context.lifespan_context.embedding_service
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+    embedding_service = context.embedding_service
 
     # Determine which vector to use
     search_vector = vector
     if search_vector is None and query_text is not None:
         # Automatically generate embedding from query text
         try:
-            search_vector = await embedding_service.embed_text(query_text)
+            search_vector = await with_timeout(
+                embedding_service.embed_text(query_text),
+                context.timeout,
+                "embed_text",
+            )
         except ValueError as e:
             return f"Error generating embedding: {str(e)}\nPlease provide a 'vector' parameter directly or configure the embedding service."
+        except TimeoutError as e:
+            return f"Error: {str(e)}"
 
     if search_vector is None:
         return (
             "Error: Either 'vector' or 'query_text' must be provided for vector search."
         )
 
-    results = await connector.vector_search(
-        collection_name=collection_name,
-        vector=search_vector,
-        vector_field=vector_field,
-        limit=limit,
-        output_fields=output_fields,
-        metric_type=metric_type,
-        filter_expr=filter_expr,
+    results = await with_timeout(
+        connector.vector_search(
+            collection_name=collection_name,
+            vector=search_vector,
+            vector_field=vector_field,
+            limit=limit,
+            output_fields=output_fields,
+            metric_type=metric_type,
+            filter_expr=filter_expr,
+        ),
+        context.timeout,
+        "vector_search",
     )
 
     query_desc = f"text '{query_text}'" if query_text else "provided vector"
@@ -852,8 +773,9 @@ async def milvus_hybrid_search(
         query_text: Text query (required for text search, used for auto-embedding if vector not provided)
         vector: Query vector for dense vector search (optional if query_text provided)
     """
-    connector = ctx.request_context.lifespan_context.connector
-    embedding_service = ctx.request_context.lifespan_context.embedding_service
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+    embedding_service = context.embedding_service
 
     if query_text is None:
         return "Error: 'query_text' is required for hybrid search."
@@ -863,19 +785,29 @@ async def milvus_hybrid_search(
     if search_vector is None:
         # Automatically generate embedding from query text
         try:
-            search_vector = await embedding_service.embed_text(query_text)
+            search_vector = await with_timeout(
+                embedding_service.embed_text(query_text),
+                context.timeout,
+                "embed_text",
+            )
         except ValueError as e:
             return f"Error generating embedding: {str(e)}\nPlease provide a 'vector' parameter directly or configure the embedding service."
+        except TimeoutError as e:
+            return f"Error: {str(e)}"
 
-    results = await connector.hybrid_search(
-        collection_name=collection_name,
-        query_text=query_text,
-        text_field=text_field,
-        vector=search_vector,
-        vector_field=vector_field,
-        limit=limit,
-        output_fields=output_fields,
-        filter_expr=filter_expr,
+    results = await with_timeout(
+        connector.hybrid_search(
+            collection_name=collection_name,
+            query_text=query_text,
+            text_field=text_field,
+            vector=search_vector,
+            vector_field=vector_field,
+            limit=limit,
+            output_fields=output_fields,
+            filter_expr=filter_expr,
+        ),
+        context.timeout,
+        "hybrid_search",
     )
 
     output = (
@@ -885,102 +817,6 @@ async def milvus_hybrid_search(
         output += f"{result}\n\n"
 
     return output
-
-
-@mcp.tool()
-async def milvus_create_collection(
-    collection_name: str,
-    collection_schema: dict[str, Any],
-    index_params: Optional[dict[str, Any]] = None,
-    ctx: Context = None,
-) -> str:
-    """
-    Create a new collection with specified schema.
-
-    Args:
-        collection_name: Name for the new collection
-        collection_schema: Collection schema definition
-        index_params: Optional index parameters
-    """
-    connector = ctx.request_context.lifespan_context.connector
-    await connector.create_collection(
-        collection_name=collection_name,
-        schema=collection_schema,
-        index_params=index_params,
-    )
-
-    return f"Collection '{collection_name}' created successfully"
-
-
-@mcp.tool()
-async def milvus_insert_data(
-    collection_name: str,
-    data: list[dict[str, Any]],
-    text_field: Optional[str] = None,
-    vector_field: Optional[str] = None,
-    auto_embed: bool = False,
-    ctx: Context = None,
-) -> str:
-    """
-    Insert data into a collection.
-    Optionally auto-generate embeddings from a text field.
-
-    Args:
-        collection_name: Name of collection
-        data: List of dictionaries, each representing a record
-        text_field: Name of the text field to generate embeddings from (if auto_embed=True)
-        vector_field: Name of the vector field to populate with embeddings (if auto_embed=True)
-        auto_embed: Whether to automatically generate embeddings from text_field
-    """
-    connector = ctx.request_context.lifespan_context.connector
-    embedding_service = ctx.request_context.lifespan_context.embedding_service
-
-    # Handle automatic embedding generation
-    if auto_embed:
-        if not text_field or not vector_field:
-            return "Error: Both 'text_field' and 'vector_field' must be specified when auto_embed=True"
-
-        try:
-            # Extract texts from data
-            texts = []
-            for item in data:
-                if text_field not in item:
-                    return f"Error: text_field '{text_field}' not found in data item: {item}"
-                texts.append(str(item[text_field]))
-
-            # Generate embeddings in batch
-            embeddings = await embedding_service.embed_batch(texts)
-
-            # Add embeddings to data
-            for item, embedding in zip(data, embeddings):
-                item[vector_field] = embedding
-
-        except ValueError as e:
-            return f"Error generating embeddings: {str(e)}\nPlease configure the embedding service or set auto_embed=False"
-
-    result = await connector.insert_data(collection_name=collection_name, data=data)
-
-    embed_info = " (with auto-generated embeddings)" if auto_embed else ""
-    return f"Data inserted into collection '{collection_name}'{embed_info} with result: {str(result)}"
-
-
-@mcp.tool()
-async def milvus_delete_entities(
-    collection_name: str, filter_expr: str, ctx: Context = None
-) -> str:
-    """
-    Delete entities from a collection based on filter expression.
-
-    Args:
-        collection_name: Name of collection
-        filter_expr: Filter expression to select entities to delete
-    """
-    connector = ctx.request_context.lifespan_context.connector
-    result = await connector.delete_entities(
-        collection_name=collection_name, filter_expr=filter_expr
-    )
-
-    return f"Entities deleted from collection '{collection_name}' with result: {str(result)}"
 
 
 @mcp.tool()
@@ -994,9 +830,15 @@ async def milvus_load_collection(
         collection_name: Name of collection to load
         replica_number: Number of replicas
     """
-    connector = ctx.request_context.lifespan_context.connector
-    await connector.load_collection(
-        collection_name=collection_name, replica_number=replica_number
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    await with_timeout(
+        connector.load_collection(
+            collection_name=collection_name, replica_number=replica_number
+        ),
+        context.timeout,
+        "load_collection",
     )
 
     return f"Collection '{collection_name}' loaded successfully with {replica_number} replica(s)"
@@ -1010,8 +852,14 @@ async def milvus_release_collection(collection_name: str, ctx: Context = None) -
     Args:
         collection_name: Name of collection to release
     """
-    connector = ctx.request_context.lifespan_context.connector
-    await connector.release_collection(collection_name=collection_name)
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    await with_timeout(
+        connector.release_collection(collection_name=collection_name),
+        context.timeout,
+        "release_collection",
+    )
 
     return f"Collection '{collection_name}' released successfully"
 
@@ -1019,8 +867,14 @@ async def milvus_release_collection(collection_name: str, ctx: Context = None) -
 @mcp.tool()
 async def milvus_list_databases(ctx: Context = None) -> str:
     """List all databases in the Milvus instance."""
-    connector = ctx.request_context.lifespan_context.connector
-    databases = await connector.list_databases()
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    databases = await with_timeout(
+        connector.list_databases(),
+        context.timeout,
+        "list_databases",
+    )
     return f"Databases in Milvus instance:\n{', '.join(databases)}"
 
 
@@ -1032,8 +886,14 @@ async def milvus_use_database(db_name: str, ctx: Context = None) -> str:
     Args:
         db_name: Name of the database to use
     """
-    connector = ctx.request_context.lifespan_context.connector
-    await connector.use_database(db_name)
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    await with_timeout(
+        connector.use_database(db_name),
+        context.timeout,
+        "use_database",
+    )
 
     return f"Switched to database '{db_name}' successfully"
 
@@ -1046,8 +906,14 @@ async def milvus_get_collection_info(collection_name: str, ctx: Context = None) 
     Args:
         collection_name: Name of collection to load
     """
-    connector = ctx.request_context.lifespan_context.connector
-    collection_info = await connector.get_collection_info(collection_name)
+    context = ctx.request_context.lifespan_context
+    connector = context.connector
+
+    collection_info = await with_timeout(
+        connector.get_collection_info(collection_name),
+        context.timeout,
+        "get_collection_info",
+    )
     info_str = json.dumps(collection_info, indent=2)
     return f"Collection information:\n{info_str}"
 
@@ -1065,6 +931,12 @@ def parse_arguments():
     )
     parser.add_argument(
         "--milvus-db", type=str, default="default", help="Milvus database name"
+    )
+    parser.add_argument(
+        "--milvus-timeout",
+        type=float,
+        default=DEFAULT_MILVUS_TIMEOUT,
+        help=f"Timeout for Milvus operations in seconds (default: {DEFAULT_MILVUS_TIMEOUT})",
     )
     parser.add_argument(
         "--embedding-api-url",
@@ -1095,6 +967,7 @@ def main():
         "milvus_uri": os.environ.get("MILVUS_URI", args.milvus_uri),
         "milvus_token": os.environ.get("MILVUS_TOKEN", args.milvus_token),
         "db_name": os.environ.get("MILVUS_DB", args.milvus_db),
+        "milvus_timeout": float(os.environ.get("MILVUS_TIMEOUT", args.milvus_timeout)),
         "embedding_api_url": os.environ.get(
             "EMBEDDING_API_URL", args.embedding_api_url
         ),

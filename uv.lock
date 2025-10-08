@@ -344,6 +344,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "fastmcp" },
+    { name = "httpx" },
     { name = "pymilvus" },
     { name = "python-dotenv" },
     { name = "ruff" },
@@ -353,6 +354,7 @@ dependencies = [
 requires-dist = [
     { name = "click", specifier = ">=8.0.0" },
     { name = "fastmcp", specifier = ">=2.6.1" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "pymilvus", specifier = ">=2.5.1" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "ruff", specifier = ">=0.11.0" },
